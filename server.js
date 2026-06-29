@@ -10,7 +10,7 @@ const SALT_ROUNDS = 10;
 // Allow only our frontend origin(s). Set FRONTEND_ORIGIN in Render to the
 // static site's URL (e.g. https://bhandol-frontend.onrender.com).
 // Comma-separate to allow several (e.g. include http://localhost:3000 for dev).
-const allowedOrigins = (process.env.FRONTEND_ORIGIN || '')
+const allowedOrigins = ("https://bhandol-backend.onrender.com" || '')
   .split(',')
   .map((o) => o.trim())
   .filter(Boolean);
