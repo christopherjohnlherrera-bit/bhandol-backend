@@ -14,16 +14,23 @@ const allowedOrigins = ("https://bhandol-backend.onrender.com" || '')
   .split(',')
   .map((o) => o.trim())
   .filter(Boolean);
+
+// app.use(cors({
+//   origin: (origin, cb) => {
+//     // Allow same-origin/non-browser requests (no Origin header) and any
+//     // explicitly allow-listed frontend origin.
+//     if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+//       return cb(null, true);
+//     }
+//     return cb(new Error(`Origin ${origin} not allowed by CORS`));
+//   },
+// }));
+
 app.use(cors({
-  origin: (origin, cb) => {
-    // Allow same-origin/non-browser requests (no Origin header) and any
-    // explicitly allow-listed frontend origin.
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-      return cb(null, true);
-    }
-    return cb(new Error(`Origin ${origin} not allowed by CORS`));
-  },
+    origin: "https://slug-panel.onrender.com"
 }));
+app.options('*', cors());
+
 app.use(express.json());
 
 // Health check — handy for confirming the backend is up.
