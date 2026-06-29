@@ -27,7 +27,7 @@ const allowedOrigins = ("https://bhandol-backend.onrender.com" || '')
 // }));
 
 app.use(cors({
-    origin: "https://slug-panel.onrender.com"
+    origin: "https://bhandol-frontend.onrender.com"
 }));
 app.options('*', cors());
 
