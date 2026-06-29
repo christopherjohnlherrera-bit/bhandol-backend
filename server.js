@@ -10,26 +10,9 @@ const SALT_ROUNDS = 10;
 // Allow only our frontend origin(s). Set FRONTEND_ORIGIN in Render to the
 // static site's URL (e.g. https://bhandol-frontend.onrender.com).
 // Comma-separate to allow several (e.g. include http://localhost:3000 for dev).
-const allowedOrigins = ("https://bhandol-backend.onrender.com" || '')
-  .split(',')
-  .map((o) => o.trim())
-  .filter(Boolean);
-
-// app.use(cors({
-//   origin: (origin, cb) => {
-//     // Allow same-origin/non-browser requests (no Origin header) and any
-//     // explicitly allow-listed frontend origin.
-//     if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-//       return cb(null, true);
-//     }
-//     return cb(new Error(`Origin ${origin} not allowed by CORS`));
-//   },
-// }));
-
 app.use(cors({
     origin: "https://bhandol-frontend.onrender.com"
 }));
-app.options('*', cors());
 
 app.use(express.json());
 
