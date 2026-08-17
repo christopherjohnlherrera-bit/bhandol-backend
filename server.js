@@ -374,16 +374,21 @@ app.post('/api/export-logs', async (req, res) => {
     const { user, type, date, time } = req.body;
 
     const errors = [];
-    if (validateString(user, 'User')) errors.push(validateString(user, 'User'));
-    if (validateString(type, 'Export Type')) errors.push(validateString(type, 'Export Type'));
-    if (validateString(date, 'Date')) errors.push(validateString(date, 'Date'));
-    if (validateString(time, 'Time')) errors.push(validateString(time, 'Time'));
+    const userErr = validateString(user, 'User');
+    const typeErr = validateString(type, 'Export Type');
+    const dateErr = validateString(date, 'Date');
+    const timeErr = validateString(time, 'Time');
+    if (userErr) errors.push(userErr);
+    if (typeErr) errors.push(typeErr);
+    if (dateErr) errors.push(dateErr);
+    if (timeErr) errors.push(timeErr);
     if (errors.length > 0) return validationError(res, errors);
 
     try {
         // createdAt gives a stable sort key in place of SQLite's AUTOINCREMENT id.
-        const result = await getDb().collection('export_logs').insertOne({ user, type, date, time, createdAt: new Date() });
-        res.json({ success: true, id: result.insertedId });
+        const now = new Date();
+        await getDb().collection('export_logs').insertOne({ user, type, date, time, createdAt: now });
+        res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -392,11 +397,21 @@ app.post('/api/export-logs', async (req, res) => {
 app.get('/api/export-logs', async (req, res) => {
     try {
         const rows = await getDb().collection('export_logs')
-            .find({}, { projection: { _id: 0, createdAt: 0 } })
+            // Expose createdAt as an ISO string so the frontend can use it as a
+            // stable clear-display cursor (filtering logs newer than a saved timestamp).
+            .find({}, { projection: { _id: 0 } })
             .sort({ createdAt: -1 })
-            .limit(20)
+            .limit(100)
             .toArray();
-        res.json(rows);
+        // Serialize createdAt to ISO string for easy client-side comparison.
+        const serialized = rows.map(r => ({
+            user: r.user,
+            type: r.type,
+            date: r.date,
+            time: r.time,
+            createdAt: r.createdAt ? r.createdAt.toISOString() : null
+        }));
+        res.json(serialized);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
