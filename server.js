@@ -286,10 +286,11 @@ app.post('/api/auth/request-password-reset', async (req, res) => {
 
 // POST /api/auth/change-password — Authenticated users (incl. mustChangePassword users)
 app.post('/api/auth/change-password', async (req, res) => {
-    const { userId, oldPassword, newPassword } = req.body;
+    const { userId, username, oldPassword, newPassword } = req.body;
 
     const errors = [];
-    const idErr  = validateString(userId,      'User ID');
+    const idVal  = userId || username;
+    const idErr  = validateString(idVal, 'User Identifier (ID or Username)');
     const oldErr = validateString(oldPassword, 'Current Password');
     const newErr = validateString(newPassword, 'New Password', 4, 100);
     if (idErr)  errors.push(idErr);
@@ -298,31 +299,41 @@ app.post('/api/auth/change-password', async (req, res) => {
     if (errors.length > 0) return validationError(res, errors);
 
     try {
-        const user = await getDb().collection('users').findOne({ id: userId, status: 'Active' });
-        if (!user) return res.status(404).json({ error: 'User not found or account is inactive.' });
+        let user = null;
+        if (userId) {
+            user = await getDb().collection('users').findOne({ id: userId, status: 'Active' });
+        }
+        if (!user && (username || userId)) {
+            const queryName = (username || userId).trim();
+            user = await getDb().collection('users').findOne({ username: queryName, status: 'Active' });
+        }
+
+        if (!user) {
+            return res.status(404).json({ error: 'User not found or account is inactive.' });
+        }
 
         // Verify current password — supports both bcrypt and legacy plaintext
         let isMatch = false;
-        if (user.password.startsWith('$2a$') || user.password.startsWith('$2b$')) {
+        if (user.password && (user.password.startsWith('$2a$') || user.password.startsWith('$2b$'))) {
             isMatch = await bcrypt.compare(oldPassword, user.password);
         } else {
             isMatch = (oldPassword === user.password);
         }
 
         if (!isMatch) {
-            return res.status(401).json({ error: 'Current password is incorrect.' });
+            return res.status(401).json({ error: 'Current (temporary) password is incorrect.' });
         }
         if (oldPassword === newPassword) {
-            return res.status(400).json({ error: 'New password must differ from the current password.' });
+            return res.status(400).json({ error: 'New password must be different from current temporary password.' });
         }
 
         const hashedNew = await bcrypt.hash(newPassword, SALT_ROUNDS);
         await getDb().collection('users').updateOne(
-            { id: userId },
-            { $set: { password: hashedNew, mustChangePassword: false } }
+            { id: user.id },
+            { $set: { password: hashedNew, mustChangePassword: false, resetRequested: false, resetReason: '' } }
         );
 
-        res.json({ success: true, message: 'Password updated successfully.' });
+        res.json({ success: true, message: 'Password updated successfully.', user: { id: user.id, username: user.username } });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
