@@ -54,13 +54,46 @@ function isDuplicateKey(err) {
 }
 
 // =============================================
+//  TEMP PASSWORD GENERATOR
+// =============================================
+// Avoids visually ambiguous characters (0/O, 1/l/I) for easier relay.
+// Guarantees at least one uppercase, lowercase, digit, and symbol.
+function generateTempPassword() {
+    const upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    const lower   = 'abcdefghjkmnpqrstuvwxyz';
+    const digits  = '23456789';
+    const symbols = '!@#$%&';
+    const all     = upper + lower + digits + symbols;
+
+    // Start with one guaranteed character from each class
+    const parts = [
+        upper[Math.floor(Math.random() * upper.length)],
+        lower[Math.floor(Math.random() * lower.length)],
+        digits[Math.floor(Math.random() * digits.length)],
+        symbols[Math.floor(Math.random() * symbols.length)],
+    ];
+    // Fill remaining 6 characters from the combined pool
+    for (let i = 4; i < 10; i++) {
+        parts.push(all[Math.floor(Math.random() * all.length)]);
+    }
+    // Fisher-Yates shuffle so the predictable first 4 positions aren't obvious
+    for (let i = parts.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [parts[i], parts[j]] = [parts[j], parts[i]];
+    }
+    return parts.join('');
+}
+
+// =============================================
 //  USERS API
 // =============================================
 app.get('/api/users', async (req, res) => {
     try {
         // SECURITY OVERRIDE: User explicitly requested passwords be viewable in Admin portal.
+        // resetRequested, resetReason, mustChangePassword included for the Admin UI.
         const rows = await getDb().collection('users')
-            .find({}, { projection: { _id: 0, id: 1, name: 1, username: 1, password: 1, role: 1, status: 1 } })
+            .find({}, { projection: { _id: 0, id: 1, name: 1, username: 1, password: 1, role: 1, status: 1,
+                                      resetRequested: 1, resetReason: 1, mustChangePassword: 1 } })
             .toArray();
         res.json(rows);
     } catch (err) {
@@ -123,6 +156,60 @@ app.delete('/api/users/:id', async (req, res) => {
     }
 });
 
+// =============================================
+//  ADMIN — RESET USER PASSWORD
+// =============================================
+// POST /api/admin/users/:userId/reset-password
+// Requires requesterId in body for server-side admin verification.
+app.post('/api/admin/users/:userId/reset-password', async (req, res) => {
+    const { requesterId } = req.body;
+
+    if (!requesterId) {
+        return res.status(401).json({ error: 'Unauthorized. requesterId is required.' });
+    }
+
+    try {
+        // Server-side role check — never trust the client for privileged operations
+        const requester = await getDb().collection('users').findOne({
+            id: requesterId, role: 'admin', status: 'Active'
+        });
+        if (!requester) {
+            return res.status(403).json({ error: 'Forbidden. Active admin account required.' });
+        }
+
+        const targetUser = await getDb().collection('users').findOne({ id: req.params.userId });
+        if (!targetUser) {
+            return res.status(404).json({ error: 'User not found.' });
+        }
+
+        // Prevent an admin from locking themselves out via this route
+        if (req.params.userId === requesterId) {
+            return res.status(400).json({ error: 'Admins cannot reset their own password via this route.' });
+        }
+
+        // Generate a secure temporary password and immediately hash it
+        const tempPassword   = generateTempPassword();
+        const hashedPassword = await bcrypt.hash(tempPassword, SALT_ROUNDS);
+
+        await getDb().collection('users').updateOne(
+            { id: req.params.userId },
+            {
+                $set: {
+                    password:           hashedPassword,
+                    resetRequested:     false,
+                    resetReason:        '',
+                    mustChangePassword: true
+                }
+            }
+        );
+
+        // Return plaintext once so the admin can relay it securely to the employee
+        res.json({ success: true, temporaryPassword: tempPassword });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/api/auth/login', async (req, res) => {
     let { username, password } = req.body;
 
@@ -154,12 +241,90 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         if (isMatch) {
-            res.json({ success: true, user: { id: row.id, name: row.name, username: row.username, role: row.role } });
+            res.json({ success: true, user: { id: row.id, name: row.name, username: row.username, role: row.role, mustChangePassword: row.mustChangePassword || false } });
         } else {
             failDelay(() => res.status(401).json({ success: false, message: 'Invalid credentials or inactive account' }));
         }
     } catch (err) {
         failDelay(() => res.status(500).json({ error: 'Authentication error.' }));
+    }
+});
+
+// =============================================
+//  PASSWORD RESET WORKFLOW
+// =============================================
+
+// POST /api/auth/request-password-reset — Public
+// Staff flag themselves so the Admin knows to generate a temp password.
+app.post('/api/auth/request-password-reset', async (req, res) => {
+    const { username, reason } = req.body;
+
+    const usernameErr = validateString(username, 'Username', 1, 100);
+    if (usernameErr) return validationError(res, [usernameErr]);
+
+    // Generic success regardless of outcome — prevents username enumeration
+    const GENERIC = { message: 'Password reset request submitted to Admin.' };
+
+    try {
+        const user = await getDb().collection('users').findOne({ username: username.trim() });
+        if (!user) return res.json(GENERIC); // Non-existent user — silent success
+
+        await getDb().collection('users').updateOne(
+            { username: username.trim() },
+            {
+                $set: {
+                    resetRequested: true,
+                    resetReason:    (reason || '').trim().substring(0, 500)
+                }
+            }
+        );
+        res.json(GENERIC);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/auth/change-password — Authenticated users (incl. mustChangePassword users)
+app.post('/api/auth/change-password', async (req, res) => {
+    const { userId, oldPassword, newPassword } = req.body;
+
+    const errors = [];
+    const idErr  = validateString(userId,      'User ID');
+    const oldErr = validateString(oldPassword, 'Current Password');
+    const newErr = validateString(newPassword, 'New Password', 4, 100);
+    if (idErr)  errors.push(idErr);
+    if (oldErr) errors.push(oldErr);
+    if (newErr) errors.push(newErr);
+    if (errors.length > 0) return validationError(res, errors);
+
+    try {
+        const user = await getDb().collection('users').findOne({ id: userId, status: 'Active' });
+        if (!user) return res.status(404).json({ error: 'User not found or account is inactive.' });
+
+        // Verify current password — supports both bcrypt and legacy plaintext
+        let isMatch = false;
+        if (user.password.startsWith('$2a$') || user.password.startsWith('$2b$')) {
+            isMatch = await bcrypt.compare(oldPassword, user.password);
+        } else {
+            isMatch = (oldPassword === user.password);
+        }
+
+        if (!isMatch) {
+            return res.status(401).json({ error: 'Current password is incorrect.' });
+        }
+        if (oldPassword === newPassword) {
+            return res.status(400).json({ error: 'New password must differ from the current password.' });
+        }
+
+        const hashedNew = await bcrypt.hash(newPassword, SALT_ROUNDS);
+        await getDb().collection('users').updateOne(
+            { id: userId },
+            { $set: { password: hashedNew, mustChangePassword: false } }
+        );
+
+        res.json({ success: true, message: 'Password updated successfully.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
