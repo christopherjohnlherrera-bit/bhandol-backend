@@ -7,6 +7,7 @@
     "start": "node server.js",
     "seed": "node seed.js",
     "migrate": "node migrate-to-mongo.js",
+    "backfill-branch": "node backfill-branch.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

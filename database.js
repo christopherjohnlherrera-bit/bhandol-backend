@@ -19,11 +19,28 @@ async function connect() {
   await client.connect();
   db = client.db(dbName);
 
+  // Drop legacy single-field unique indexes from the pre-branch schema so the
+  // new per-branch compound uniqueness can be created. Ignore "not found".
+  const dropIfExists = async (coll, name) => {
+    try { await db.collection(coll).dropIndex(name); } catch (e) { /* index absent — fine */ }
+  };
+  await Promise.all([
+    dropIfExists('products', 'id_1'),
+    dropIfExists('transactions', 'id_1'),
+  ]);
+
   await Promise.all([
     db.collection('users').createIndex({ id: 1 }, { unique: true }),
     db.collection('users').createIndex({ username: 1 }, { unique: true }),
-    db.collection('products').createIndex({ id: 1 }, { unique: true }),
-    db.collection('transactions').createIndex({ id: 1 }, { unique: true }),
+    db.collection('users').createIndex({ branchId: 1 }),
+    // Branch registry (tenant list).
+    db.collection('branches').createIndex({ id: 1 }, { unique: true }),
+    // Product & transaction ids are now unique *within a branch*, so the same
+    // SKU / sequence can exist independently at each location.
+    db.collection('products').createIndex({ branchId: 1, id: 1 }, { unique: true }),
+    db.collection('products').createIndex({ branchId: 1 }),
+    db.collection('transactions').createIndex({ branchId: 1, id: 1 }, { unique: true }),
+    db.collection('transactions').createIndex({ branchId: 1, date: 1 }),
     db.collection('settings').createIndex({ key: 1 }, { unique: true }),
   ]);
 

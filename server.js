@@ -2,16 +2,31 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const { connect, getDb } = require('./database');
+const { signToken, verifyToken } = require('./auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SALT_ROUNDS = 10;
 
-// Allow only our frontend origin(s). Set FRONTEND_ORIGIN in Render to the
-// static site's URL (e.g. https://bhandol-frontend.onrender.com).
-// Comma-separate to allow several (e.g. include http://localhost:3000 for dev).
+// Allowed frontend origins. The deployed static site plus common local-dev
+// servers (Live Server :5500, a backend-served page :3000). Override/extend in
+// production by setting FRONTEND_ORIGIN to a comma-separated list.
+const DEFAULT_ORIGINS = [
+    "https://bhandol-frontend.onrender.com",
+    "http://localhost:5500", "http://127.0.0.1:5500", // VS Code Live Server
+    "http://localhost:3000", "http://127.0.0.1:3000",
+];
+const ALLOWED_ORIGINS = (process.env.FRONTEND_ORIGIN
+    ? process.env.FRONTEND_ORIGIN.split(",").map(s => s.trim())
+    : DEFAULT_ORIGINS);
+
 app.use(cors({
-    origin: "https://bhandol-frontend.onrender.com"
+    origin: (origin, cb) => {
+        // Allow same-origin / non-browser requests (no Origin header) and any
+        // whitelisted origin. Auth is via bearer token, not cookies.
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+        return cb(new Error(`Origin not allowed by CORS: ${origin}`));
+    }
 }));
 
 app.use(express.json());
@@ -54,6 +69,53 @@ function isDuplicateKey(err) {
 }
 
 // =============================================
+//  AUTH + BRANCH-ISOLATION MIDDLEWARE
+// =============================================
+// Every protected route runs `authenticate` first. The caller's identity and
+// branch come from the SIGNED TOKEN — never from query params or the body — so
+// a staff client cannot reach another branch's data by tampering with a request.
+
+function authenticate(req, res, next) {
+    const hdr = req.headers.authorization || '';
+    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+    const payload = token && verifyToken(token);
+    if (!payload) {
+        return res.status(401).json({ error: 'Authentication required. Please log in again.' });
+    }
+    req.auth = payload; // { uid, role, bid }
+    next();
+}
+
+function requireAdmin(req, res, next) {
+    if (!req.auth || req.auth.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden. Administrator access required.' });
+    }
+    next();
+}
+
+// READ scope. Staff are locked to their own branch. Admins see everything, or a
+// single branch when they pass ?branch=<branchId> (?branch=all / omitted = all).
+function branchReadFilter(req) {
+    if (req.auth.role !== 'admin') return { branchId: req.auth.bid };
+    const b = req.query.branch;
+    if (!b || b === 'all') return {};
+    return { branchId: b };
+}
+
+// WRITE scope guard. Staff writes are always constrained to their branch; admin
+// writes may touch any branch. Combine this with the {id} match on updates/deletes.
+function branchWriteMatch(req) {
+    return req.auth.role === 'admin' ? {} : { branchId: req.auth.bid };
+}
+
+// The branch a NEW record belongs to: forced to the staff branch; admins must
+// name the target branch explicitly in the request body.
+function resolveWriteBranch(req) {
+    if (req.auth.role !== 'admin') return req.auth.bid;
+    return req.body.branchId || null;
+}
+
+// =============================================
 //  TEMP PASSWORD GENERATOR
 // =============================================
 // Avoids visually ambiguous characters (0/O, 1/l/I) for easier relay.
@@ -87,13 +149,13 @@ function generateTempPassword() {
 // =============================================
 //  USERS API
 // =============================================
-app.get('/api/users', async (req, res) => {
+// Branch registry — any authenticated user may read the list (needed for the
+// admin switcher and the staff branch label).
+app.get('/api/branches', authenticate, async (req, res) => {
     try {
-        // SECURITY OVERRIDE: User explicitly requested passwords be viewable in Admin portal.
-        // resetRequested, resetReason, mustChangePassword included for the Admin UI.
-        const rows = await getDb().collection('users')
-            .find({}, { projection: { _id: 0, id: 1, name: 1, username: 1, password: 1, role: 1, status: 1,
-                                      resetRequested: 1, resetReason: 1, mustChangePassword: 1 } })
+        const rows = await getDb().collection('branches')
+            .find({}, { projection: { _id: 0, id: 1, code: 1, name: 1, status: 1 } })
+            .sort({ name: 1 })
             .toArray();
         res.json(rows);
     } catch (err) {
@@ -101,8 +163,25 @@ app.get('/api/users', async (req, res) => {
     }
 });
 
-app.post('/api/users', async (req, res) => {
+// User management is admin-only.
+app.get('/api/users', authenticate, requireAdmin, async (req, res) => {
+    try {
+        // SECURITY OVERRIDE: User explicitly requested passwords be viewable in Admin portal.
+        // resetRequested, resetReason, mustChangePassword included for the Admin UI.
+        // branchId included so the admin can see each staff member's assigned branch.
+        const rows = await getDb().collection('users')
+            .find({}, { projection: { _id: 0, id: 1, name: 1, username: 1, password: 1, role: 1, status: 1,
+                                      branchId: 1, resetRequested: 1, resetReason: 1, mustChangePassword: 1 } })
+            .toArray();
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/users', authenticate, requireAdmin, async (req, res) => {
     const { id, name, username, password, role, status } = req.body;
+    let { branchId } = req.body;
 
     // Validate inputs
     const errors = [];
@@ -120,12 +199,25 @@ app.post('/api/users', async (req, res) => {
     if (statusErr) errors.push(statusErr);
     if (!['admin', 'staff'].includes(role)) errors.push('Role must be "admin" or "staff".');
     if (!['Active', 'Inactive'].includes(status)) errors.push('Status must be "Active" or "Inactive".');
+
+    // Branch assignment rules: staff MUST have a valid branch; admins are
+    // branch-agnostic (branchId forced to null regardless of what was sent).
+    if (role === 'admin') {
+        branchId = null;
+    } else if (role === 'staff') {
+        if (!branchId) {
+            errors.push('Branch assignment is required for staff accounts.');
+        } else {
+            const branch = await getDb().collection('branches').findOne({ id: branchId });
+            if (!branch) errors.push('Assigned branch does not exist.');
+        }
+    }
     if (errors.length > 0) return validationError(res, errors);
 
     try {
         // SECURITY OVERRIDE: User explicitly requested plaintext passwords.
-        await getDb().collection('users').insertOne({ id, name, username, password, role, status });
-        res.json({ id, name, username, role, status });
+        await getDb().collection('users').insertOne({ id, name, username, password, role, status, branchId });
+        res.json({ id, name, username, role, status, branchId });
     } catch (err) {
         if (isDuplicateKey(err)) {
             return res.status(409).json({ error: 'Username already exists.' });
@@ -134,7 +226,7 @@ app.post('/api/users', async (req, res) => {
     }
 });
 
-app.put('/api/users/:id/status', async (req, res) => {
+app.put('/api/users/:id/status', authenticate, requireAdmin, async (req, res) => {
     const { status } = req.body;
     if (!['Active', 'Inactive'].includes(status)) {
         return validationError(res, ['Status must be "Active" or "Inactive".']);
@@ -147,7 +239,7 @@ app.put('/api/users/:id/status', async (req, res) => {
     }
 });
 
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', authenticate, requireAdmin, async (req, res) => {
     try {
         await getDb().collection('users').deleteOne({ id: req.params.id });
         res.json({ message: 'User deleted' });
@@ -241,7 +333,23 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         if (isMatch) {
-            res.json({ success: true, user: { id: row.id, name: row.name, username: row.username, role: row.role, mustChangePassword: row.mustChangePassword || false } });
+            // Resolve the human-readable branch name (null for admins = all branches).
+            let branchName = null;
+            if (row.branchId) {
+                const br = await getDb().collection('branches').findOne({ id: row.branchId }, { projection: { _id: 0, name: 1 } });
+                branchName = br ? br.name : null;
+            }
+            // Sign a token that carries the branch — this is what enforces isolation.
+            const token = signToken({ uid: row.id, role: row.role, bid: row.branchId || null });
+            res.json({
+                success: true,
+                token,
+                user: {
+                    id: row.id, name: row.name, username: row.username, role: row.role,
+                    branchId: row.branchId || null, branchName,
+                    mustChangePassword: row.mustChangePassword || false
+                }
+            });
         } else {
             failDelay(() => res.status(401).json({ success: false, message: 'Invalid credentials or inactive account' }));
         }
@@ -342,17 +450,19 @@ app.post('/api/auth/change-password', async (req, res) => {
 // =============================================
 //  INVENTORY API
 // =============================================
-app.get('/api/inventory', async (req, res) => {
+app.get('/api/inventory', authenticate, async (req, res) => {
     try {
-        const rows = await getDb().collection('products').find({}, NO_ID).toArray();
+        // Staff → their branch only. Admin → all, or ?branch=<id> for one branch.
+        const rows = await getDb().collection('products').find(branchReadFilter(req), NO_ID).toArray();
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.post('/api/inventory', async (req, res) => {
+app.post('/api/inventory', authenticate, async (req, res) => {
     const { id, name, category, unit, quantity, dateAdded, user } = req.body;
+    const branchId = resolveWriteBranch(req); // forced to staff branch; admin supplies it
 
     // Validate — store result to avoid calling validator twice
     const errors = [];
@@ -370,11 +480,13 @@ app.post('/api/inventory', async (req, res) => {
     if (qtyErr) errors.push(qtyErr);
     if (dateErr) errors.push(dateErr);
     if (userErr) errors.push(userErr);
+    if (!branchId) errors.push('A target branch is required (admins must select a branch).');
     if (errors.length > 0) return validationError(res, errors);
 
     try {
         await getDb().collection('products').insertOne({
             id,
+            branchId,
             name: name.trim(),
             category: category.trim(),
             unit: unit.trim(),
@@ -382,14 +494,14 @@ app.post('/api/inventory', async (req, res) => {
             dateAdded,
             user,
         });
-        res.json({ success: true, id });
+        res.json({ success: true, id, branchId });
     } catch (err) {
-        if (isDuplicateKey(err)) return res.status(409).json({ error: 'Product ID already exists.' });
+        if (isDuplicateKey(err)) return res.status(409).json({ error: 'Product ID already exists in this branch.' });
         res.status(500).json({ error: err.message });
     }
 });
 
-app.put('/api/inventory/:id', async (req, res) => {
+app.put('/api/inventory/:id', authenticate, async (req, res) => {
     const { name, category, unit, quantity } = req.body;
 
     const errors = [];
@@ -404,17 +516,19 @@ app.put('/api/inventory/:id', async (req, res) => {
     if (errors.length > 0) return validationError(res, errors);
 
     try {
-        await getDb().collection('products').updateOne(
-            { id: req.params.id },
+        // branchWriteMatch prevents staff from editing another branch's product.
+        const result = await getDb().collection('products').updateOne(
+            { id: req.params.id, ...branchWriteMatch(req) },
             { $set: { name: name.trim(), category: category.trim(), unit: unit.trim(), quantity: parseInt(quantity, 10) } }
         );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Product not found in your branch.' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.put('/api/inventory/:id/quantity', async (req, res) => {
+app.put('/api/inventory/:id/quantity', authenticate, async (req, res) => {
     const { quantityDelta, user } = req.body;
     // Bug Fix: store result once to avoid redundant double-call
     const deltaErr = validateInt(quantityDelta, 'Quantity Delta', -999999, 999999);
@@ -423,14 +537,15 @@ app.put('/api/inventory/:id/quantity', async (req, res) => {
     const delta = parseInt(quantityDelta, 10);
     const products = getDb().collection('products');
     const settings = getDb().collection('settings');
+    const scope = branchWriteMatch(req); // staff → own branch; admin → any
 
     try {
         // Low Stock Protection — only applies to stock-out (negative delta)
         if (delta < 0) {
             const protRow = await settings.findOne({ key: 'lowStockProtectionEnabled' });
             if (protRow && protRow.value === 'true') {
-                const prod = await products.findOne({ id: req.params.id });
-                if (!prod) return res.status(500).json({ error: 'Product not found.' });
+                const prod = await products.findOne({ id: req.params.id, ...scope });
+                if (!prod) return res.status(404).json({ error: 'Product not found in your branch.' });
 
                 const thRow = await settings.findOne({ key: 'lowStockThreshold' });
                 const threshold = thRow ? parseInt(thRow.value, 10) : 8;
@@ -449,16 +564,18 @@ app.put('/api/inventory/:id/quantity', async (req, res) => {
 
         const update = { $inc: { quantity: delta } };
         if (user) update.$set = { user };
-        await products.updateOne({ id: req.params.id }, update);
+        const result = await products.updateOne({ id: req.params.id, ...scope }, update);
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Product not found in your branch.' });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.delete('/api/inventory/:id', async (req, res) => {
+app.delete('/api/inventory/:id', authenticate, async (req, res) => {
     try {
-        await getDb().collection('products').deleteOne({ id: req.params.id });
+        const result = await getDb().collection('products').deleteOne({ id: req.params.id, ...branchWriteMatch(req) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Product not found in your branch.' });
         res.json({ message: 'Product deleted' });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -468,17 +585,18 @@ app.delete('/api/inventory/:id', async (req, res) => {
 // =============================================
 //  TRANSACTIONS API
 // =============================================
-app.get('/api/transactions', async (req, res) => {
+app.get('/api/transactions', authenticate, async (req, res) => {
     try {
-        const rows = await getDb().collection('transactions').find({}, NO_ID).toArray();
+        const rows = await getDb().collection('transactions').find(branchReadFilter(req), NO_ID).toArray();
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.post('/api/transactions', async (req, res) => {
+app.post('/api/transactions', authenticate, async (req, res) => {
     const { id, product, category, type, quantity, unit, date, time, user } = req.body;
+    const branchId = resolveWriteBranch(req);
 
     const errors = [];
     const idErr = validateString(id, 'ID');
@@ -498,46 +616,119 @@ app.post('/api/transactions', async (req, res) => {
     if (dateErr) errors.push(dateErr);
     if (timeErr) errors.push(timeErr);
     if (userErr) errors.push(userErr);
+    if (!branchId) errors.push('A target branch is required (admins must select a branch).');
     if (errors.length > 0) return validationError(res, errors);
 
     try {
         await getDb().collection('transactions').insertOne({
-            id, product, category, type, quantity: parseInt(quantity, 10), unit, date, time, user
+            id, branchId, product, category, type, quantity: parseInt(quantity, 10), unit, date, time, user
         });
-        res.json({ success: true, id });
+        res.json({ success: true, id, branchId });
     } catch (err) {
-        if (isDuplicateKey(err)) return res.status(409).json({ error: 'Transaction ID already exists.' });
+        if (isDuplicateKey(err)) return res.status(409).json({ error: 'Transaction ID already exists in this branch.' });
         res.status(500).json({ error: err.message });
     }
 });
 
 // NOTE: Specific routes must be defined BEFORE parameterized routes to avoid mis-matching.
 // e.g. DELETE /api/transactions/type/Stock In must NOT match /:id with id='type'
-app.delete('/api/transactions', async (req, res) => {
+app.delete('/api/transactions', authenticate, async (req, res) => {
     try {
-        await getDb().collection('transactions').deleteMany({});
+        // Staff clear only their branch; admin clears everything.
+        await getDb().collection('transactions').deleteMany({ ...branchWriteMatch(req) });
         res.json({ success: true, message: 'All transactions cleared' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.delete('/api/transactions/type/:type', async (req, res) => {
+app.delete('/api/transactions/type/:type', authenticate, async (req, res) => {
     if (!['Stock In', 'Stock Out'].includes(req.params.type)) {
         return validationError(res, ['Type must be "Stock In" or "Stock Out".']);
     }
     try {
-        await getDb().collection('transactions').deleteMany({ type: req.params.type });
+        await getDb().collection('transactions').deleteMany({ type: req.params.type, ...branchWriteMatch(req) });
         res.json({ success: true, message: `${req.params.type} transactions cleared` });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-app.delete('/api/transactions/:id', async (req, res) => {
+app.delete('/api/transactions/:id', authenticate, async (req, res) => {
     try {
-        await getDb().collection('transactions').deleteOne({ id: req.params.id });
+        const result = await getDb().collection('transactions').deleteOne({ id: req.params.id, ...branchWriteMatch(req) });
+        if (result.deletedCount === 0) return res.status(404).json({ error: 'Transaction not found in your branch.' });
         res.json({ message: 'Transaction deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// =============================================
+//  ADMIN — MULTI-BRANCH OVERVIEW / REPORTING
+// =============================================
+// GET /api/admin/overview?branch=all | <branchId>
+// Powers the admin dashboard's three views (Luzon, Montalban, Consolidated).
+// Returns headline metrics + a per-branch breakdown so the frontend can render
+// either a single-branch summary or the aggregated totals from one response.
+app.get('/api/admin/overview', authenticate, requireAdmin, async (req, res) => {
+    const branch = req.query.branch;
+    const match = (!branch || branch === 'all') ? {} : { branchId: branch };
+
+    try {
+        const db = getDb();
+        const branches = await db.collection('branches')
+            .find({}, { projection: { _id: 0, id: 1, name: 1 } }).toArray();
+
+        // Movement totals grouped by branch + type (net = Stock In − Stock Out).
+        const txnByBranch = await db.collection('transactions').aggregate([
+            { $match: match },
+            { $group: { _id: { branchId: '$branchId', type: '$type' }, qty: { $sum: '$quantity' }, count: { $sum: 1 } } }
+        ]).toArray();
+
+        // Inventory totals grouped by branch.
+        const invByBranch = await db.collection('products').aggregate([
+            { $match: match },
+            { $group: { _id: '$branchId', items: { $sum: 1 }, units: { $sum: '$quantity' } } }
+        ]).toArray();
+
+        // Assemble a per-branch record, then a consolidated roll-up.
+        const byId = {};
+        const ensure = (bid) => (byId[bid] ||= { branchId: bid, stockIn: 0, stockOut: 0, netMovement: 0, txnCount: 0, itemCount: 0, totalUnits: 0 });
+
+        txnByBranch.forEach(r => {
+            const rec = ensure(r._id.branchId);
+            if (r._id.type === 'Stock In') rec.stockIn += r.qty;
+            else if (r._id.type === 'Stock Out') rec.stockOut += r.qty;
+            rec.txnCount += r.count;
+        });
+        invByBranch.forEach(r => {
+            const rec = ensure(r._id);
+            rec.itemCount = r.items;
+            rec.totalUnits = r.units;
+        });
+
+        const nameOf = (bid) => (branches.find(b => b.id === bid) || {}).name || bid || 'Unassigned';
+        const perBranch = Object.values(byId).map(r => ({
+            ...r, branchName: nameOf(r.branchId), netMovement: r.stockIn - r.stockOut
+        }));
+
+        // Consolidated totals across whatever is in scope.
+        const consolidated = perBranch.reduce((acc, r) => ({
+            stockIn: acc.stockIn + r.stockIn,
+            stockOut: acc.stockOut + r.stockOut,
+            netMovement: acc.netMovement + r.netMovement,
+            txnCount: acc.txnCount + r.txnCount,
+            itemCount: acc.itemCount + r.itemCount,
+            totalUnits: acc.totalUnits + r.totalUnits
+        }), { stockIn: 0, stockOut: 0, netMovement: 0, txnCount: 0, itemCount: 0, totalUnits: 0 });
+
+        res.json({
+            scope: (!branch || branch === 'all') ? 'all' : branch,
+            branches,
+            consolidated,
+            perBranch
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -617,7 +808,7 @@ app.get('/api/settings', async (req, res) => {
     }
 });
 
-app.post('/api/settings', async (req, res) => {
+app.post('/api/settings', authenticate, requireAdmin, async (req, res) => {
     const { key, value } = req.body;
     const keyErr = validateString(key, 'Key');
     if (keyErr) return validationError(res, [keyErr]);
@@ -644,7 +835,7 @@ app.post('/api/settings', async (req, res) => {
 // =============================================
 //  SYSTEM TOOLS
 // =============================================
-app.post('/api/system/restore', async (req, res) => {
+app.post('/api/system/restore', authenticate, requireAdmin, async (req, res) => {
     const { users, products, transactions } = req.body;
     if (!users || !products || !transactions) {
         return validationError(res, ['Backup must contain users, products, and transactions arrays.']);
