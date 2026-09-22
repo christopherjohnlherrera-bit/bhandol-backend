@@ -579,8 +579,11 @@ app.put('/api/inventory/:id/quantity', authenticate, async (req, res) => {
 
         // ── GOVERNANCE: Min Safety Reserve + Hard-Zero Block (Stock-Out) ──────
         if (delta < 0) {
+            const requestedQuantity = Math.abs(delta);
+            const projectedStock = prod.quantity - requestedQuantity;
+
             // Hard-block: prevent negative balance regardless of enforcement state
-            if (prod.quantity + delta < 0) {
+            if (projectedStock < 0) {
                 return res.status(409).json({
                     status: 'BLOCKED',
                     error: 'NEGATIVE_BALANCE_PREVENTED',
@@ -589,24 +592,37 @@ app.put('/api/inventory/:id/quantity', authenticate, async (req, res) => {
                 });
             }
 
-            // Threshold enforcement: min_threshold check + CRITICAL_LOW_STOCK log
+            // Min Threshold Hard-Block:
+            // Check if is_enforced === true OR Global Enforcement is active
             const globalRow = await settings.findOne({ key: 'global_threshold_enforcement' });
             const globalOn = globalRow && globalRow.value === 'true';
-            if (globalOn && prod.is_enforced && prod.min_threshold > 0) {
-                const newStock = prod.quantity + delta; // delta is negative
-                if (newStock < prod.min_threshold) {
-                    // Log CRITICAL_LOW_STOCK audit event (soft warning — does not block)
-                    await auditLog.insertOne({
-                        event: 'CRITICAL_LOW_STOCK',
-                        productId: prod.id,
-                        productName: prod.name,
-                        branchId: prod.branchId,
-                        resultingQty: newStock,
-                        min_threshold: prod.min_threshold,
-                        actor: req.auth.uid,
-                        timestamp: new Date()
-                    });
-                }
+            const isEnforced = Boolean(prod.is_enforced || globalOn);
+            const minThreshold = parseInt(prod.min_threshold, 10) || 0;
+
+            if (isEnforced && minThreshold > 0 && projectedStock < minThreshold) {
+                // Record THRESHOLD_INTERCEPT in Governance Audit Trail
+                await auditLog.insertOne({
+                    event: 'THRESHOLD_INTERCEPT',
+                    productId: prod.id,
+                    productName: prod.name,
+                    branchId: prod.branchId,
+                    current_stock: prod.quantity,
+                    requestedQuantity,
+                    projectedStock,
+                    min_threshold: minThreshold,
+                    actor: req.auth.uid,
+                    timestamp: new Date()
+                });
+
+                return res.status(400).json({
+                    status: 'BLOCKED',
+                    error: 'THRESHOLD_INTERCEPT',
+                    message: `Stock-Out blocked: deducting ${requestedQuantity} unit(s) of ${prod.name} leaves ${projectedStock} unit(s), violating enforced MIN threshold of ${minThreshold}.`,
+                    min_threshold: minThreshold,
+                    current_stock: prod.quantity,
+                    requestedQuantity,
+                    projectedStock
+                });
             }
 
             // Legacy Low Stock Protection (still respected alongside threshold system)
@@ -614,14 +630,13 @@ app.put('/api/inventory/:id/quantity', authenticate, async (req, res) => {
             if (protRow && protRow.value === 'true') {
                 const thRow = await settings.findOne({ key: 'lowStockThreshold' });
                 const threshold = thRow ? parseInt(thRow.value, 10) : 8;
-                const resultingQty = prod.quantity + delta;
-                if (resultingQty <= threshold) {
+                if (projectedStock <= threshold) {
                     return res.status(409).json({
                         error: 'LOW_STOCK_PROTECTION',
-                        message: `Low Stock Protection is active. Cannot reduce stock of this item to ${resultingQty} — the minimum safe quantity is ${threshold + 1} units.`,
+                        message: `Low Stock Protection is active. Cannot reduce stock of this item to ${projectedStock} — the minimum safe quantity is ${threshold + 1} units.`,
                         threshold,
                         currentQty: prod.quantity,
-                        resultingQty
+                        resultingQty: projectedStock
                     });
                 }
             }
@@ -642,6 +657,92 @@ app.delete('/api/inventory/:id', authenticate, async (req, res) => {
         const result = await getDb().collection('products').deleteOne({ id: req.params.id, ...branchWriteMatch(req) });
         if (result.deletedCount === 0) return res.status(404).json({ error: 'Product not found in your branch.' });
         res.json({ message: 'Product deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// =============================================
+//  STOCK-OUT / POS DEDUCTION API
+// =============================================
+app.post('/api/stock-out', authenticate, async (req, res) => {
+    const { id, productId, quantity, unit, user, date, time, txnId } = req.body;
+    const targetId = id || productId;
+    const qty = parseInt(quantity, 10);
+    if (!targetId) return res.status(400).json({ error: 'Product ID is required.' });
+    if (isNaN(qty) || qty <= 0) return res.status(400).json({ error: 'Valid quantity > 0 is required.' });
+
+    const products = getDb().collection('products');
+    const settings = getDb().collection('settings');
+    const auditLog = getDb().collection('audit_log');
+    const scope = branchWriteMatch(req);
+
+    try {
+        const prod = await products.findOne({ id: targetId, ...scope });
+        if (!prod) return res.status(404).json({ error: 'Product not found in your branch.' });
+
+        const projectedStock = prod.quantity - qty;
+        if (projectedStock < 0) {
+            return res.status(409).json({
+                status: 'BLOCKED',
+                error: 'NEGATIVE_BALANCE_PREVENTED',
+                message: `Stock-Out blocked: cannot reduce ${prod.name} below zero. Available: ${prod.quantity}.`,
+                currentQty: prod.quantity
+            });
+        }
+
+        const globalRow = await settings.findOne({ key: 'global_threshold_enforcement' });
+        const globalOn = globalRow && globalRow.value === 'true';
+        const isEnforced = Boolean(prod.is_enforced || globalOn);
+        const minThreshold = parseInt(prod.min_threshold, 10) || 0;
+
+        if (isEnforced && minThreshold > 0 && projectedStock < minThreshold) {
+            await auditLog.insertOne({
+                event: 'THRESHOLD_INTERCEPT',
+                productId: prod.id,
+                productName: prod.name,
+                branchId: prod.branchId,
+                current_stock: prod.quantity,
+                requestedQuantity: qty,
+                projectedStock,
+                min_threshold: minThreshold,
+                actor: req.auth.uid,
+                timestamp: new Date()
+            });
+
+            return res.status(400).json({
+                status: 'BLOCKED',
+                error: 'THRESHOLD_INTERCEPT',
+                message: `Stock-Out blocked: deducting ${qty} unit(s) of ${prod.name} leaves ${projectedStock} unit(s), violating enforced MIN threshold of ${minThreshold}.`,
+                min_threshold: minThreshold,
+                current_stock: prod.quantity,
+                requestedQuantity: qty,
+                projectedStock
+            });
+        }
+
+        // Apply deduction
+        const update = { $inc: { quantity: -qty } };
+        if (user) update.$set = { user };
+        await products.updateOne({ id: targetId, ...scope }, update);
+
+        // Record transaction
+        const resolvedTxnId = txnId || `TXN${Date.now()}`;
+        const txnBranchId = resolveWriteBranch(req) || prod.branchId;
+        await getDb().collection('transactions').insertOne({
+            id: resolvedTxnId,
+            branchId: txnBranchId,
+            product: prod.name,
+            category: prod.category,
+            type: 'Stock Out',
+            quantity: qty,
+            unit: unit || prod.unit,
+            date: date || new Date().toLocaleDateString('en-GB'),
+            time: time || new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+            user: user || req.auth.uid
+        });
+
+        res.json({ success: true, txnId: resolvedTxnId, resultingQty: projectedStock });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
