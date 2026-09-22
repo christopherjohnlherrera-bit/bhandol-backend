@@ -537,19 +537,84 @@ app.put('/api/inventory/:id/quantity', authenticate, async (req, res) => {
     const delta = parseInt(quantityDelta, 10);
     const products = getDb().collection('products');
     const settings = getDb().collection('settings');
+    const auditLog = getDb().collection('audit_log');
     const scope = branchWriteMatch(req); // staff → own branch; admin → any
 
     try {
-        // Low Stock Protection — only applies to stock-out (negative delta)
+        // ── Fetch the product once; used by all enforcement checks below ──────
+        const prod = await products.findOne({ id: req.params.id, ...scope });
+        if (!prod) return res.status(404).json({ error: 'Product not found in your branch.' });
+
+        // ── GOVERNANCE: Max-Capacity Guardrail (Stock-In, positive delta) ─────
+        if (delta > 0) {
+            const globalRow = await settings.findOne({ key: 'global_threshold_enforcement' });
+            const globalOn = globalRow && globalRow.value === 'true';
+            if (globalOn && prod.is_enforced && prod.max_threshold > 0) {
+                const newStock = prod.quantity + delta;
+                if (newStock > prod.max_threshold) {
+                    const branchName = prod.branchId || 'this branch';
+                    await auditLog.insertOne({
+                        event: 'STOCK_IN_BLOCKED_MAX_THRESHOLD',
+                        productId: prod.id,
+                        productName: prod.name,
+                        branchId: prod.branchId,
+                        attempted: newStock,
+                        max_threshold: prod.max_threshold,
+                        actor: req.auth.uid,
+                        timestamp: new Date()
+                    });
+                    return res.status(409).json({
+                        status: 'BLOCKED',
+                        error: 'MAX_THRESHOLD_EXCEEDED',
+                        module: 'stock-in.html',
+                        redirect_suggested: 'threshold.html',
+                        message: `Stock-In blocked: ${branchName} Branch capacity limit of ${prod.max_threshold} exceeded for ${prod.name}. Requested total: ${newStock}. Submit an expansion request in threshold.html.`,
+                        max_threshold: prod.max_threshold,
+                        currentQty: prod.quantity,
+                        requestedTotal: newStock
+                    });
+                }
+            }
+        }
+
+        // ── GOVERNANCE: Min Safety Reserve + Hard-Zero Block (Stock-Out) ──────
         if (delta < 0) {
+            // Hard-block: prevent negative balance regardless of enforcement state
+            if (prod.quantity + delta < 0) {
+                return res.status(409).json({
+                    status: 'BLOCKED',
+                    error: 'NEGATIVE_BALANCE_PREVENTED',
+                    message: `Stock-Out blocked: cannot reduce ${prod.name} below zero. Available: ${prod.quantity}.`,
+                    currentQty: prod.quantity
+                });
+            }
+
+            // Threshold enforcement: min_threshold check + CRITICAL_LOW_STOCK log
+            const globalRow = await settings.findOne({ key: 'global_threshold_enforcement' });
+            const globalOn = globalRow && globalRow.value === 'true';
+            if (globalOn && prod.is_enforced && prod.min_threshold > 0) {
+                const newStock = prod.quantity + delta; // delta is negative
+                if (newStock < prod.min_threshold) {
+                    // Log CRITICAL_LOW_STOCK audit event (soft warning — does not block)
+                    await auditLog.insertOne({
+                        event: 'CRITICAL_LOW_STOCK',
+                        productId: prod.id,
+                        productName: prod.name,
+                        branchId: prod.branchId,
+                        resultingQty: newStock,
+                        min_threshold: prod.min_threshold,
+                        actor: req.auth.uid,
+                        timestamp: new Date()
+                    });
+                }
+            }
+
+            // Legacy Low Stock Protection (still respected alongside threshold system)
             const protRow = await settings.findOne({ key: 'lowStockProtectionEnabled' });
             if (protRow && protRow.value === 'true') {
-                const prod = await products.findOne({ id: req.params.id, ...scope });
-                if (!prod) return res.status(404).json({ error: 'Product not found in your branch.' });
-
                 const thRow = await settings.findOne({ key: 'lowStockThreshold' });
                 const threshold = thRow ? parseInt(thRow.value, 10) : 8;
-                const resultingQty = prod.quantity + delta; // delta is negative
+                const resultingQty = prod.quantity + delta;
                 if (resultingQty <= threshold) {
                     return res.status(409).json({
                         error: 'LOW_STOCK_PROTECTION',
@@ -815,7 +880,7 @@ app.post('/api/settings', authenticate, requireAdmin, async (req, res) => {
     if (value === null || value === undefined) return validationError(res, ['Value is required.']);
 
     // Whitelist allowed setting keys to prevent arbitrary writes
-    const ALLOWED_KEYS = ['lowStockProtectionEnabled', 'lowStockThreshold'];
+    const ALLOWED_KEYS = ['lowStockProtectionEnabled', 'lowStockThreshold', 'global_threshold_enforcement'];
     if (!ALLOWED_KEYS.includes(key)) {
         return res.status(400).json({ error: `Unknown setting key: ${key}` });
     }
@@ -857,6 +922,235 @@ app.post('/api/system/restore', authenticate, requireAdmin, async (req, res) => 
         if (transactions.length) await db.collection('transactions').insertMany(clean(transactions));
 
         res.json({ success: true, message: 'Restore completed' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// =============================================
+//  THRESHOLD GOVERNANCE API
+// =============================================
+
+// GET /api/threshold/settings — returns global enforcement state + per-product thresholds
+app.get('/api/threshold/settings', authenticate, async (req, res) => {
+    try {
+        const db = getDb();
+        const globalRow = await db.collection('settings').findOne({ key: 'global_threshold_enforcement' });
+        res.json({
+            global_threshold_enforcement: globalRow ? globalRow.value === 'true' : false
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/threshold/products — products with threshold fields for the caller's branch scope
+app.get('/api/threshold/products', authenticate, async (req, res) => {
+    try {
+        const rows = await getDb().collection('products')
+            .find(branchReadFilter(req), {
+                projection: { _id: 0, id: 1, name: 1, category: 1, unit: 1, quantity: 1,
+                              branchId: 1, min_threshold: 1, max_threshold: 1, is_enforced: 1 }
+            })
+            .sort({ name: 1 })
+            .toArray();
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /api/threshold/products/:id — admin sets per-product threshold config
+app.put('/api/threshold/products/:id', authenticate, requireAdmin, async (req, res) => {
+    const { min_threshold, max_threshold, is_enforced } = req.body;
+    const errors = [];
+    const minErr = validateInt(min_threshold, 'Min Threshold', 0, 999999);
+    const maxErr = validateInt(max_threshold, 'Max Threshold', 0, 999999);
+    if (minErr) errors.push(minErr);
+    if (maxErr) errors.push(maxErr);
+    if (typeof is_enforced !== 'boolean') errors.push('is_enforced must be a boolean.');
+    if (parseInt(max_threshold, 10) > 0 && parseInt(min_threshold, 10) > parseInt(max_threshold, 10)) {
+        errors.push('Min threshold cannot exceed max threshold.');
+    }
+    if (errors.length > 0) return validationError(res, errors);
+
+    try {
+        const result = await getDb().collection('products').updateOne(
+            { id: req.params.id },
+            { $set: {
+                min_threshold: parseInt(min_threshold, 10),
+                max_threshold: parseInt(max_threshold, 10),
+                is_enforced: Boolean(is_enforced)
+            }}
+        );
+        if (result.matchedCount === 0) return res.status(404).json({ error: 'Product not found.' });
+
+        // Audit log the configuration change
+        await getDb().collection('audit_log').insertOne({
+            event: 'THRESHOLD_CONFIG_UPDATED',
+            productId: req.params.id,
+            min_threshold: parseInt(min_threshold, 10),
+            max_threshold: parseInt(max_threshold, 10),
+            is_enforced: Boolean(is_enforced),
+            actor: req.auth.uid,
+            timestamp: new Date()
+        });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/threshold/requests — admin: all; staff: own branch
+app.get('/api/threshold/requests', authenticate, async (req, res) => {
+    try {
+        const filter = req.auth.role === 'admin' ? {} : { branchId: req.auth.bid };
+        const rows = await getDb().collection('threshold_requests')
+            .find(filter, { projection: { _id: 0 } })
+            .sort({ submittedAt: -1 })
+            .toArray();
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/threshold/requests — staff or admin submits an expansion request
+app.post('/api/threshold/requests', authenticate, async (req, res) => {
+    const { productId, requestedMax, reason } = req.body;
+    const errors = [];
+    const pidErr = validateString(productId, 'Product ID');
+    const maxErr = validateInt(requestedMax, 'Requested Max', 1, 999999);
+    if (pidErr) errors.push(pidErr);
+    if (maxErr) errors.push(maxErr);
+    if (errors.length > 0) return validationError(res, errors);
+
+    try {
+        const db = getDb();
+        // Fetch current product to validate the request makes sense
+        const prod = await db.collection('products').findOne({ id: productId });
+        if (!prod) return res.status(404).json({ error: 'Product not found.' });
+
+        const currentMax = prod.max_threshold || 0;
+        if (parseInt(requestedMax, 10) <= currentMax) {
+            return res.status(400).json({
+                error: 'Validation failed',
+                details: [`Requested max (${requestedMax}) must be greater than current max threshold (${currentMax}).`]
+            });
+        }
+
+        // Generate request ID
+        const existing = await db.collection('threshold_requests').countDocuments();
+        const reqId = 'REQ' + String(existing + 1).padStart(3, '0');
+
+        const doc = {
+            id: reqId,
+            branchId: prod.branchId,
+            productId,
+            productName: prod.name,
+            requestedMax: parseInt(requestedMax, 10),
+            currentMax,
+            reason: (reason || '').trim().substring(0, 500),
+            status: 'PENDING',
+            submittedBy: req.auth.uid,
+            submittedAt: new Date(),
+            reviewedBy: null,
+            reviewedAt: null,
+            rejectReason: null
+        };
+        await db.collection('threshold_requests').insertOne(doc);
+        res.json({ success: true, id: reqId });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /api/threshold/requests/:id/approve — admin approves, updates product max_threshold
+app.put('/api/threshold/requests/:id/approve', authenticate, requireAdmin, async (req, res) => {
+    try {
+        const db = getDb();
+        const reqDoc = await db.collection('threshold_requests').findOne({ id: req.params.id });
+        if (!reqDoc) return res.status(404).json({ error: 'Request not found.' });
+        if (reqDoc.status !== 'PENDING') {
+            return res.status(400).json({ error: `Request is already ${reqDoc.status}.` });
+        }
+
+        // Update the product's max_threshold immediately
+        await db.collection('products').updateOne(
+            { id: reqDoc.productId },
+            { $set: { max_threshold: reqDoc.requestedMax } }
+        );
+
+        // Update the request document
+        await db.collection('threshold_requests').updateOne(
+            { id: req.params.id },
+            { $set: { status: 'APPROVED', reviewedBy: req.auth.uid, reviewedAt: new Date() } }
+        );
+
+        // Audit trail
+        await db.collection('audit_log').insertOne({
+            event: 'EXPANSION_REQUEST_APPROVED',
+            requestId: req.params.id,
+            productId: reqDoc.productId,
+            productName: reqDoc.productName,
+            branchId: reqDoc.branchId,
+            newMax: reqDoc.requestedMax,
+            actor: req.auth.uid,
+            timestamp: new Date()
+        });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PUT /api/threshold/requests/:id/reject — admin rejects with reason
+app.put('/api/threshold/requests/:id/reject', authenticate, requireAdmin, async (req, res) => {
+    const { rejectReason } = req.body;
+    try {
+        const db = getDb();
+        const reqDoc = await db.collection('threshold_requests').findOne({ id: req.params.id });
+        if (!reqDoc) return res.status(404).json({ error: 'Request not found.' });
+        if (reqDoc.status !== 'PENDING') {
+            return res.status(400).json({ error: `Request is already ${reqDoc.status}.` });
+        }
+
+        await db.collection('threshold_requests').updateOne(
+            { id: req.params.id },
+            { $set: {
+                status: 'REJECTED',
+                reviewedBy: req.auth.uid,
+                reviewedAt: new Date(),
+                rejectReason: (rejectReason || '').trim().substring(0, 500)
+            }}
+        );
+
+        // Audit trail
+        await db.collection('audit_log').insertOne({
+            event: 'EXPANSION_REQUEST_REJECTED',
+            requestId: req.params.id,
+            productId: reqDoc.productId,
+            productName: reqDoc.productName,
+            branchId: reqDoc.branchId,
+            rejectReason: (rejectReason || '').trim(),
+            actor: req.auth.uid,
+            timestamp: new Date()
+        });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/threshold/audit — admin: recent audit log entries (last 50)
+app.get('/api/threshold/audit', authenticate, requireAdmin, async (req, res) => {
+    try {
+        const rows = await getDb().collection('audit_log')
+            .find({}, { projection: { _id: 0 } })
+            .sort({ timestamp: -1 })
+            .limit(50)
+            .toArray();
+        res.json(rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
