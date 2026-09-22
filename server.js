@@ -962,7 +962,7 @@ app.get('/api/threshold/products', authenticate, async (req, res) => {
 
 // PUT /api/threshold/products/:id — admin sets per-product threshold config
 app.put('/api/threshold/products/:id', authenticate, requireAdmin, async (req, res) => {
-    const { min_threshold, max_threshold, is_enforced } = req.body;
+    const { min_threshold, max_threshold, is_enforced, branchId } = req.body;
     const errors = [];
     const minErr = validateInt(min_threshold, 'Min Threshold', 0, 999999);
     const maxErr = validateInt(max_threshold, 'Max Threshold', 0, 999999);
@@ -975,8 +975,10 @@ app.put('/api/threshold/products/:id', authenticate, requireAdmin, async (req, r
     if (errors.length > 0) return validationError(res, errors);
 
     try {
+        const query = { id: req.params.id };
+        if (branchId) query.branchId = branchId;
         const result = await getDb().collection('products').updateOne(
-            { id: req.params.id },
+            query,
             { $set: {
                 min_threshold: parseInt(min_threshold, 10),
                 max_threshold: parseInt(max_threshold, 10),
@@ -989,6 +991,7 @@ app.put('/api/threshold/products/:id', authenticate, requireAdmin, async (req, r
         await getDb().collection('audit_log').insertOne({
             event: 'THRESHOLD_CONFIG_UPDATED',
             productId: req.params.id,
+            branchId: branchId || null,
             min_threshold: parseInt(min_threshold, 10),
             max_threshold: parseInt(max_threshold, 10),
             is_enforced: Boolean(is_enforced),
