@@ -761,36 +761,132 @@ app.get('/api/transactions', authenticate, async (req, res) => {
 });
 
 app.post('/api/transactions', authenticate, async (req, res) => {
-    const { id, product, category, type, quantity, unit, date, time, user } = req.body;
-    const branchId = resolveWriteBranch(req);
+    console.log('[POST /api/transactions] Incoming body:', JSON.stringify(req.body), 'Auth:', req.auth);
+    const db = getDb();
 
-    const errors = [];
-    const idErr = validateString(id, 'ID');
-    const productErr = validateString(product, 'Product');
-    const catErr = validateString(category, 'Category');
-    const qtyErr = validateInt(quantity, 'Quantity', 1);
-    const unitErr = validateString(unit, 'Unit');
-    const dateErr = validateString(date, 'Date');
-    const timeErr = validateString(time, 'Time');
-    const userErr = validateString(user, 'User');
-    if (idErr) errors.push(idErr);
-    if (productErr) errors.push(productErr);
-    if (catErr) errors.push(catErr);
-    if (!['Stock In', 'Stock Out'].includes(type)) errors.push('Type must be "Stock In" or "Stock Out".');
-    if (qtyErr) errors.push(qtyErr);
-    if (unitErr) errors.push(unitErr);
-    if (dateErr) errors.push(dateErr);
-    if (timeErr) errors.push(timeErr);
-    if (userErr) errors.push(userErr);
-    if (!branchId) errors.push('A target branch is required (admins must select a branch).');
-    if (errors.length > 0) return validationError(res, errors);
+    let { id, productId, product, name, category, type, quantity, qty, amount, unit, date, time, user, branch, branchId, updateStock, syncStock } = req.body;
+
+    // 1. Normalize Type ("IN", "OUT", "Stock In", "Stock Out", "STOCK_IN", "STOCK_OUT")
+    let normType = null;
+    const rawType = String(type || '').trim();
+    if (/^(in|stock[\s_-]?in)$/i.test(rawType)) {
+        normType = 'Stock In';
+    } else if (/^(out|stock[\s_-]?out)$/i.test(rawType)) {
+        normType = 'Stock Out';
+    } else if (rawType.toLowerCase().includes('in')) {
+        normType = 'Stock In';
+    } else if (rawType.toLowerCase().includes('out')) {
+        normType = 'Stock Out';
+    }
+
+    if (!normType) {
+        return validationError(res, ['Type must be "Stock In" or "Stock Out" (or "IN" / "OUT").']);
+    }
+
+    // 2. Normalize Quantity
+    const rawQty = quantity ?? qty ?? amount;
+    const parsedQty = Number(rawQty);
+    if (rawQty === undefined || isNaN(parsedQty) || parsedQty <= 0) {
+        return validationError(res, ['Quantity must be a valid positive number greater than 0.']);
+    }
+    const finalQty = Math.round(parsedQty);
+
+    // 3. Resolve Product & Metadata from DB if possible
+    let targetProductId = productId || req.body.targetId || null;
+    let targetProductName = product || name || null;
+    let matchedProd = null;
 
     try {
-        await getDb().collection('transactions').insertOne({
-            id, branchId, product, category, type, quantity: parseInt(quantity, 10), unit, date, time, user
+        if (targetProductId) {
+            matchedProd = await db.collection('products').findOne({ id: String(targetProductId) });
+        }
+        if (!matchedProd && targetProductName) {
+            matchedProd = await db.collection('products').findOne({
+                name: { $regex: new RegExp(`^${String(targetProductName).trim()}$`, 'i') }
+            });
+        }
+    } catch (lookupErr) {
+        console.warn('[POST /api/transactions] Product lookup warning:', lookupErr.message);
+    }
+
+    if (matchedProd) {
+        targetProductId = targetProductId || matchedProd.id;
+        targetProductName = targetProductName || matchedProd.name;
+        category = category || matchedProd.category || 'General';
+        unit = unit || matchedProd.unit || 'pcs';
+        if (!branchId && !branch) {
+            branchId = matchedProd.branchId;
+        }
+    }
+
+    // 4. Resolve Branch
+    let targetBranch = null;
+    if (req.auth.role !== 'admin') {
+        targetBranch = req.auth.bid;
+    } else {
+        targetBranch = branchId || branch || (matchedProd ? matchedProd.branchId : null);
+        if (!targetBranch) {
+            const qb = req.query.branch;
+            if (qb && qb !== 'all') targetBranch = qb;
+        }
+        if (!targetBranch) {
+            // Default to 'b1' for admins if no branch context could be derived
+            targetBranch = 'b1';
+        }
+    }
+
+    // Normalize branch name to ID if needed (e.g., 'Luzon' -> 'b1')
+    try {
+        const bMatch = await db.collection('branches').findOne({
+            $or: [{ id: targetBranch }, { name: { $regex: new RegExp(`^${targetBranch}$`, 'i') } }]
         });
-        res.json({ success: true, id, branchId });
+        if (bMatch) targetBranch = bMatch.id;
+    } catch (_) {}
+
+    // 5. Resolve Defaults for Transaction Record
+    const now = new Date();
+    const finalId = (id && String(id).trim()) ? String(id).trim() : ('TXN' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 1000));
+    const finalProduct = targetProductName ? String(targetProductName).trim() : 'Inventory Item';
+    const finalCategory = category ? String(category).trim() : 'General';
+    const finalUnit = unit ? String(unit).trim() : 'pcs';
+    const finalDate = (date && String(date).trim()) ? String(date).trim() : now.toLocaleDateString('en-GB');
+    const finalTime = (time && String(time).trim()) ? String(time).trim() : now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+    const finalUser = (user && String(user).trim()) ? String(user).trim() : (req.auth.uid || 'Admin');
+
+    const txnDoc = {
+        id: finalId,
+        productId: targetProductId ? String(targetProductId) : null,
+        branchId: targetBranch,
+        product: finalProduct,
+        category: finalCategory,
+        type: normType,
+        quantity: finalQty,
+        unit: finalUnit,
+        date: finalDate,
+        time: finalTime,
+        user: finalUser
+    };
+
+    try {
+        // 6. Direct stock synchronization if requested or if updateStock is explicitly true
+        const shouldUpdateStock = updateStock === true || updateStock === 'true' || syncStock === true || syncStock === 'true';
+        if (shouldUpdateStock && (targetProductId || matchedProd)) {
+            const stockDelta = (normType === 'Stock In') ? finalQty : -finalQty;
+            const pQuery = targetProductId ? { id: String(targetProductId) } : { name: finalProduct };
+            if (targetBranch) pQuery.branchId = targetBranch;
+
+            await db.collection('products').updateOne(pQuery, {
+                $inc: { quantity: stockDelta },
+                $set: { user: finalUser }
+            });
+            console.log(`[POST /api/transactions] Updated stock by delta ${stockDelta} for product ${finalProduct}`);
+        }
+
+        await db.collection('transactions').insertOne(txnDoc);
+        console.log('[POST /api/transactions] Successfully inserted transaction:', finalId);
+        res.json({ success: true, id: finalId, branchId: targetBranch, transaction: txnDoc });
     } catch (err) {
+        console.error('[POST /api/transactions] Error inserting transaction:', err);
         if (isDuplicateKey(err)) return res.status(409).json({ error: 'Transaction ID already exists in this branch.' });
         res.status(500).json({ error: err.message });
     }
