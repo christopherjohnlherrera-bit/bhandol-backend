@@ -904,7 +904,7 @@ app.get('/api/admin/overview', authenticate, requireAdmin, async (req, res) => {
 //  EXPORT LOGS API
 // =============================================
 app.post('/api/export-logs', async (req, res) => {
-    const { user, type, date, time } = req.body;
+    const { user, type, date, time, branch } = req.body;
 
     const errors = [];
     const userErr = validateString(user, 'User');
@@ -920,7 +920,8 @@ app.post('/api/export-logs', async (req, res) => {
     try {
         // createdAt gives a stable sort key in place of SQLite's AUTOINCREMENT id.
         const now = new Date();
-        await getDb().collection('export_logs').insertOne({ user, type, date, time, createdAt: now });
+        const branchVal = (typeof branch === 'string' && branch.trim()) ? branch.trim() : 'Consolidated';
+        await getDb().collection('export_logs').insertOne({ user, type, date, time, branch: branchVal, createdAt: now });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -942,6 +943,7 @@ app.get('/api/export-logs', async (req, res) => {
             type: r.type,
             date: r.date,
             time: r.time,
+            branch: r.branch || 'Consolidated',
             createdAt: r.createdAt ? r.createdAt.toISOString() : null
         }));
         res.json(serialized);
@@ -999,34 +1001,153 @@ app.post('/api/settings', authenticate, requireAdmin, async (req, res) => {
 });
 
 // =============================================
-//  SYSTEM TOOLS
+//  BRANCH-SCOPED DATA BACKUP & RESTORE
 // =============================================
-app.post('/api/system/restore', authenticate, requireAdmin, async (req, res) => {
-    const { users, products, transactions } = req.body;
-    if (!users || !products || !transactions) {
-        return validationError(res, ['Backup must contain users, products, and transactions arrays.']);
-    }
 
+// Helper: resolve branch filter for a given scope
+async function resolveBranchFilter(scope) {
+    if (!scope || scope === 'Consolidated' || scope === 'all') {
+        return { isConsolidated: true, filter: {}, targetName: 'Consolidated', targetId: null };
+    }
+    const db = getDb();
+    let targetName = scope;
+    let targetId = scope;
+    const branchDoc = await db.collection('branches').findOne({
+        $or: [{ name: new RegExp(`^${scope}$`, 'i') }, { id: scope }]
+    });
+    if (branchDoc) {
+        targetName = branchDoc.name;
+        targetId = branchDoc.id;
+    }
+    const filter = {
+        $or: [
+            { branch: targetName },
+            { branchId: targetId },
+            { branch: targetId },
+            { branchId: targetName }
+        ]
+    };
+    return { isConsolidated: false, filter, targetName, targetId };
+}
+
+// GET /api/backup/download — branch-scoped data export (.json)
+app.get('/api/backup/download', authenticate, requireAdmin, async (req, res) => {
+    const requestedScope = (req.query.scope || 'Consolidated').trim();
     try {
         const db = getDb();
-        await Promise.all([
-            db.collection('users').deleteMany({}),
-            db.collection('products').deleteMany({}),
-            db.collection('transactions').deleteMany({}),
-        ]);
+        const { isConsolidated, filter, targetName, targetId } = await resolveBranchFilter(requestedScope);
 
-        // Strip any _id that may be present in the backup so Mongo assigns fresh ones.
-        const clean = (arr) => arr.map(({ _id, ...rest }) => rest);
+        let products = [];
+        let transactions = [];
+        let users = [];
 
-        if (users.length) await db.collection('users').insertMany(clean(users));
-        if (products.length) await db.collection('products').insertMany(clean(products));
-        if (transactions.length) await db.collection('transactions').insertMany(clean(transactions));
+        if (isConsolidated) {
+            products = await db.collection('products').find({}, NO_ID).sort({ id: 1 }).toArray();
+            transactions = await db.collection('transactions').find({}, NO_ID).sort({ date: -1 }).toArray();
+            users = await db.collection('users').find({}, NO_ID).sort({ id: 1 }).toArray();
+        } else {
+            products = await db.collection('products').find(filter, NO_ID).sort({ id: 1 }).toArray();
+            transactions = await db.collection('transactions').find(filter, NO_ID).sort({ date: -1 }).toArray();
+            users = await db.collection('users').find({
+                $or: [{ branchId: targetId }, { branch: targetName }]
+            }, NO_ID).sort({ id: 1 }).toArray();
+        }
 
-        res.json({ success: true, message: 'Restore completed' });
+        const payload = {
+            metadata: {
+                scope: isConsolidated ? 'Consolidated' : targetName,
+                exportedAt: new Date().toISOString(),
+                version: '2.0',
+                exportedBy: req.auth.uid,
+                counts: {
+                    products: products.length,
+                    transactions: transactions.length,
+                    users: users.length
+                }
+            },
+            users,
+            products,
+            transactions
+        };
+
+        const safeFilename = `bhandol_backup_${isConsolidated ? 'consolidated' : targetName.toLowerCase()}_${new Date().toISOString().split('T')[0]}.json`;
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+        res.json(payload);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
+
+// POST /api/backup/restore & POST /api/system/restore — branch-scoped or consolidated restore
+const handleRestore = async (req, res) => {
+    const { users, products, transactions, metadata } = req.body;
+    if (!users || !products || !transactions) {
+        return validationError(res, ['Backup must contain users, products, and transactions arrays.']);
+    }
+
+    const scope = (metadata?.scope || req.body.scope || req.query.scope || 'Consolidated').trim();
+
+    try {
+        const db = getDb();
+        const { isConsolidated, filter, targetName, targetId } = await resolveBranchFilter(scope);
+
+        // Strip _id to ensure MongoDB assigns fresh ObjectIds
+        const clean = (arr) => arr.map(({ _id, ...rest }) => rest);
+
+        if (isConsolidated) {
+            // Full Consolidated Restore: replace all data across system
+            await Promise.all([
+                db.collection('users').deleteMany({}),
+                db.collection('products').deleteMany({}),
+                db.collection('transactions').deleteMany({}),
+            ]);
+
+            if (users.length) await db.collection('users').insertMany(clean(users));
+            if (products.length) await db.collection('products').insertMany(clean(products));
+            if (transactions.length) await db.collection('transactions').insertMany(clean(transactions));
+
+            res.json({
+                success: true,
+                message: 'Consolidated restore completed successfully across all branches.',
+                scope: 'Consolidated'
+            });
+        } else {
+            // Targeted Branch Restore: critical safety guarantee — other branches are completely untouched!
+            await Promise.all([
+                db.collection('products').deleteMany(filter),
+                db.collection('transactions').deleteMany(filter),
+                db.collection('users').deleteMany({ role: 'staff', ...filter })
+            ]);
+
+            // Ensure imported records carry both branch and branchId for target branch
+            const stampBranch = (arr) => arr.map(({ _id, ...rest }) => ({
+                ...rest,
+                branch: targetName,
+                branchId: targetId
+            }));
+
+            const cleanProducts = stampBranch(products);
+            const cleanTransactions = stampBranch(transactions);
+            const cleanUsers = stampBranch(users);
+
+            if (cleanProducts.length) await db.collection('products').insertMany(cleanProducts);
+            if (cleanTransactions.length) await db.collection('transactions').insertMany(cleanTransactions);
+            if (cleanUsers.length) await db.collection('users').insertMany(cleanUsers);
+
+            res.json({
+                success: true,
+                message: `Branch-targeted restore completed successfully for ${targetName}. Other branches remained untouched.`,
+                scope: targetName
+            });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
+app.post('/api/backup/restore', authenticate, requireAdmin, handleRestore);
+app.post('/api/system/restore', authenticate, requireAdmin, handleRestore);
 
 // =============================================
 //  THRESHOLD GOVERNANCE API
@@ -1051,7 +1172,7 @@ app.get('/api/threshold/products', authenticate, async (req, res) => {
         const rows = await getDb().collection('products')
             .find(branchReadFilter(req), {
                 projection: { _id: 0, id: 1, name: 1, category: 1, unit: 1, quantity: 1,
-                              branchId: 1, min_threshold: 1, max_threshold: 1, is_enforced: 1 }
+                              branchId: 1, min_threshold: 1, max_threshold: 1, low_stock_alert: 1, is_enforced: 1 }
             })
             .sort({ name: 1 })
             .toArray();
@@ -1063,12 +1184,16 @@ app.get('/api/threshold/products', authenticate, async (req, res) => {
 
 // PUT /api/threshold/products/:id — admin sets per-product threshold config
 app.put('/api/threshold/products/:id', authenticate, requireAdmin, async (req, res) => {
-    const { min_threshold, max_threshold, is_enforced, branchId } = req.body;
+    const { min_threshold, max_threshold, low_stock_alert, is_enforced, branchId } = req.body;
     const errors = [];
     const minErr = validateInt(min_threshold, 'Min Threshold', 0, 999999);
     const maxErr = validateInt(max_threshold, 'Max Threshold', 0, 999999);
     if (minErr) errors.push(minErr);
     if (maxErr) errors.push(maxErr);
+    if (low_stock_alert !== undefined && low_stock_alert !== null && low_stock_alert !== '') {
+        const alertErr = validateInt(low_stock_alert, 'Low Stock Alert Threshold', 0, 999999);
+        if (alertErr) errors.push(alertErr);
+    }
     if (typeof is_enforced !== 'boolean') errors.push('is_enforced must be a boolean.');
     if (parseInt(max_threshold, 10) > 0 && parseInt(min_threshold, 10) > parseInt(max_threshold, 10)) {
         errors.push('Min threshold cannot exceed max threshold.');
@@ -1078,13 +1203,18 @@ app.put('/api/threshold/products/:id', authenticate, requireAdmin, async (req, r
     try {
         const query = { id: req.params.id };
         if (branchId) query.branchId = branchId;
+        const updateFields = {
+            min_threshold: parseInt(min_threshold, 10),
+            max_threshold: parseInt(max_threshold, 10),
+            is_enforced: Boolean(is_enforced)
+        };
+        if (low_stock_alert !== undefined && low_stock_alert !== null && low_stock_alert !== '') {
+            updateFields.low_stock_alert = parseInt(low_stock_alert, 10);
+        }
+
         const result = await getDb().collection('products').updateOne(
             query,
-            { $set: {
-                min_threshold: parseInt(min_threshold, 10),
-                max_threshold: parseInt(max_threshold, 10),
-                is_enforced: Boolean(is_enforced)
-            }}
+            { $set: updateFields }
         );
         if (result.matchedCount === 0) return res.status(404).json({ error: 'Product not found.' });
 
@@ -1095,6 +1225,7 @@ app.put('/api/threshold/products/:id', authenticate, requireAdmin, async (req, r
             branchId: branchId || null,
             min_threshold: parseInt(min_threshold, 10),
             max_threshold: parseInt(max_threshold, 10),
+            low_stock_alert: updateFields.low_stock_alert !== undefined ? updateFields.low_stock_alert : null,
             is_enforced: Boolean(is_enforced),
             actor: req.auth.uid,
             timestamp: new Date()
