@@ -1149,6 +1149,50 @@ const handleRestore = async (req, res) => {
 app.post('/api/backup/restore', authenticate, requireAdmin, handleRestore);
 app.post('/api/system/restore', authenticate, requireAdmin, handleRestore);
 
+// DELETE /api/system/clear-data & DELETE /api/backup/clear-data — Admin system wipe
+const handleClearData = async (req, res) => {
+    const scope = (req.query.scope || req.body.scope || 'Consolidated').trim();
+    try {
+        const db = getDb();
+        const { isConsolidated, filter, targetName } = await resolveBranchFilter(scope);
+
+        if (isConsolidated) {
+            // Delete all products, transactions, threshold requests, audit logs; keep admin users safe
+            await Promise.all([
+                db.collection('products').deleteMany({}),
+                db.collection('transactions').deleteMany({}),
+                db.collection('threshold_requests').deleteMany({}),
+                db.collection('audit_log').deleteMany({}),
+                db.collection('users').deleteMany({ role: { $ne: 'admin' } })
+            ]);
+            res.json({
+                success: true,
+                message: 'All system inventory, transactions, and requests have been cleared across all branches.',
+                scope: 'Consolidated'
+            });
+        } else {
+            // Branch scoped deletion
+            await Promise.all([
+                db.collection('products').deleteMany(filter),
+                db.collection('transactions').deleteMany(filter),
+                db.collection('threshold_requests').deleteMany(filter),
+                db.collection('users').deleteMany({ role: 'staff', ...filter })
+            ]);
+            res.json({
+                success: true,
+                message: `All data for ${targetName} Branch has been cleared. Other branches remain intact.`,
+                scope: targetName
+            });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
+app.delete('/api/system/clear-data', authenticate, requireAdmin, handleClearData);
+app.delete('/api/backup/clear-data', authenticate, requireAdmin, handleClearData);
+app.post('/api/system/clear-data', authenticate, requireAdmin, handleClearData);
+
 // =============================================
 //  THRESHOLD GOVERNANCE API
 // =============================================
